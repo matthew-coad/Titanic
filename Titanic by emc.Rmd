@@ -26,7 +26,7 @@ library(stringi)
 library(knitr)
 library(caret)
 
-source("emc.r")
+library(emc)
 
 # Development only utility functions that start and stop a local cluster to
 # Speed up training time
@@ -196,7 +196,7 @@ To determine which of these core algorithm works best I'll simply try them all.
 First thing we need to do to set up an emc experiment it so to define the parameters for each task we will perform in the experiment. For the age prediction experiement its just all the algorithms we want to try.
 
 ```{r}
-age_algorithms <- emc_algorithms() %>% dplyr::filter(regression, core) %>% dplyr::select(algorithm)
+age_algorithms <- emc_algorithms() %>% filter(regression, core) %>% select(algorithm)
 ```
 
 Emc uses the caret package to do most of the heavy lifting when it comes to invoking all the different machine learning algorithms. We'll need to set up the bits that caret needs to work. Here we set up the training data, train control and data pre-processing recipe.

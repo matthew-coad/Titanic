@@ -818,7 +818,7 @@ titanic &lt;- bind_rows(load_titanic_train(), load_titanic_test()) %&gt;% prepar
 <div id="running-the-age-prediction-experiment" class="section level3">
 <h3>Running the Age Prediction experiment</h3>
 <p>First thing we need to do to set up an emc experiment it so to define the parameters for each task we will perform in the experiment. For the age prediction experiement its just all the algorithms we want to try.</p>
-<pre class="r"><code>age_algorithms &lt;- emc_algorithms() %&gt;% dplyr::filter(regression, core) %&gt;% dplyr::select(algorithm)</code></pre>
+<pre class="r"><code>age_algorithms &lt;- emc_algorithms() %&gt;% filter(regression, core) %&gt;% select(algorithm)</code></pre>
 <p>Emc uses the caret package to do most of the heavy lifting when it comes to invoking all the different machine learning algorithms. We’ll need to set up the bits that caret needs to work. Here we set up the training data, train control and data pre-processing recipe.</p>
 <pre class="r"><code>age_data &lt;- 
     # From our titanic data
