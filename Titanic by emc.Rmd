@@ -1,0 +1,517 @@
+---
+title: "Titanic by EMC"
+author: "Matthew Coad"
+date: "25 September 2018"
+output: html_document
+---
+
+# Introduction
+
+In this article I'm going to introduce emc. EMC is a set of techniques and associated tools in R for doing data science experiments.
+
+For this article I'm going to do some experiments on the [Titanic](https://www.kaggle.com/c/titanic) data set taken from Kaggle.
+
+The Titanic data set is a classic for learning predictive modelling. The classic objective with this data set is using information 
+like gender, age and social status to determine who was likely to get a place on a life-boat and survive.
+
+```{r setup, include=FALSE}
+
+library(knitr)
+opts_chunk$set(echo = TRUE)
+
+library(MASS)
+library(tidyverse)
+library(recipes)
+library(stringi)
+library(knitr)
+library(caret)
+
+source("emc.r")
+
+# Development only utility functions that start and stop a local cluster to
+# Speed up training time
+if (!exists("titanic_cluster")) {
+    titanic_cluster <- NULL
+}
+
+start_cluster <- function() {
+    if (is.null(titanic_cluster)) {
+        titanic_cluster <<- parallel::makeCluster(3)
+        doParallel::registerDoParallel(titanic_cluster)
+    } else {
+        message("Cluster is already running")
+    }
+}
+
+stop_cluster <- function() {
+    if (!is.null(titanic_cluster)) {
+        parallel::stopCluster(titanic_cluster)
+        titanic_cluster <<- NULL
+    }
+}
+
+```
+
+## Loading the data
+
+```{r}
+
+titanic_data_path <- function(filename) path.expand(file.path(".", "Data", filename))
+
+load_titanic_train <- function() {
+    titanic <- read_csv(titanic_data_path("Titanic.csv"), col_types =
+        cols(
+          PassengerId = col_integer(),
+          Survived = col_integer(),
+          Pclass = col_integer(),
+          Name = col_character(),
+          Sex = col_character(),
+          Age = col_double(),
+          SibSp = col_integer(),
+          Parch = col_integer(),
+          Ticket = col_character(),
+          Fare = col_double(),
+          Cabin = col_character(),
+          Embarked = col_character()
+    ))
+    titanic
+}
+
+load_titanic_test <- function() {
+    titanic_test <- read_csv(titanic_data_path("titanic_test.csv"), col_types =
+        cols(
+          PassengerId = col_integer(),
+          Pclass = col_integer(),
+          Name = col_character(),
+          Sex = col_character(),
+          Age = col_double(),
+          SibSp = col_integer(),
+          Parch = col_integer(),
+          Ticket = col_character(),
+          Fare = col_double(),
+          Cabin = col_character(),
+          Embarked = col_character()
+    ))
+    titanic_test
+}
+
+prepare_titanic <- function(source) {
+    
+    Name <- source$Name
+    Title <- sapply(Name, FUN = function(x) { strsplit(x, split = '[,.]')[[1]][2] })
+    Title <- sub(' ', '', Title)
+    SibSp = source$SibSp
+    Parch = source$Parch
+    Survived <- factor(if_else(source$Survived == 1, "Yes", "No", missing = NA_character_))
+
+    Age = source$Age
+    Honourable <- Title %in% c('Dr', 'Col', 'Capt', 'Major', 'Don', 'Sir', 'Dona', 'Lady', 'the Countess', 'Jonkheer', 'Rev')
+    Adult_Title <- Title %in% c('Mr', 'Ms', 'Mlle', 'Mme', 'Mrs')
+
+    Deck <- source$Cabin %>% stri_sub(1, 1) %>% factor(levels = c("A", "B", "C", "D", "E", "F", "T"), ordered = TRUE)
+
+    tibble(
+        Survived = Survived,
+        PassengerId = source$PassengerId,
+        Name = source$Name,
+        Honourable_Title = as.integer(Honourable),
+        Adult_Title = as.integer(Adult_Title),
+        Sex = factor(source$Sex),
+        Age = source$Age,
+        CabinClass = factor(source$Pclass, levels = c(1, 2, 3), ordered = TRUE),
+        Deck = Deck,
+        Fare = 1 + source$Fare,
+        SibSp = source$SibSp,
+        Parch = source$Parch,
+        Embarked = factor(source$Embarked)
+    )
+}
+
+titanic <- bind_rows(load_titanic_train(), load_titanic_test()) %>% prepare_titanic()
+
+```
+
+When the data is downloaded from Kaggle you get a training data set and a test data set. I've combined them both into a single dataset named "titanic" and done a little feature engineering.
+
+The main issue with this dataset is that one of the useful predictors in the dataset, Age, has a lot of unknown values. In preparation for dealing with this i've stripped the honorific from their names and used that to determine if they have an "Adult" honorific, like Mr, Mrs, Mlle etc. This information can be used to get an idea about how old the person was.
+
+I've marked those people with an "Honourable" honorific like Lady, Sir, Major etc. Maybe these people had an easier time getting a spot on a life-boat.
+
+Also I've used the ticket number to determine which deck the person was accomodated on.
+
+After that processing the data looks like this.
+
+```{r}
+
+titanic %>% dplyr::slice(1:10) %>% kable(digits = 2)
+
+```
+
+## Problems with the data
+
+With data loaded lets use emc to start examining it. We'll use the emc_variable_degeneracy function to find variables which have degeneracy or missing data problems.
+
+```{r}
+
+emc_variable_degeneracy(titanic) %>% kable(digits = 2)
+
+```
+
+There are 418 missing values for the Survived column but we expect that because we included the test set in this data set. Naturally those rows will get dropped out when training the prediction model.
+
+There are 1309 unique passengers ID's for the 1309 records we have so clearly its an identifier. We'll drop that column.
+
+The name is not useful as a predictor so that will go.
+
+The work we did picking out those people with honourable titles doesn't seem worth it because only 29 people have them and thus the column has near zero variance. That will cause issues for lots of algorithms so we'll drop that column.
+
+We only know the deck each passengers cabin was on for 209 people so right now so it doesn't seen useful. So its out too.
+
+The fare and the port they embarked from is missing for a few values. Even a few missing values will cause many machine learning algorithms to fail so we'll just use mean values to impute them.
+
+After those modifications we'll have some nice clean data, except for the passengers age.
+
+## Age Imputation
+
+There are 263 passengers for which we don't know the age. With the cry of "Women and children first" ringing in our ears it seems a good bet that age is a useful predictor. As previously mentioned missing values will cause problems for most of the machine learning algorithms so we to do something. We could use the features built into the caret package to fix the missing values but where is the fun in that. I'll use the features of emc to create a predictive model which i'll use to predict them.
+
+### Which algorithm to try?
+
+There are many algorithms we could use to predict the missing ages. But which one?
+
+The primary idea behind emc is that you do experiments to try to determine which algorithm works best. Predicting the age is a regression problem so we'll pick from those. That would still leave hundreds of algorithms to try which is a bit much. Emc has a list of *core* algorithms that have wide applicability and cover a broad range of techniques so we'll look at those.
+
+The following query lists all the emc core algorithms that are suitable for a regression problem.
+
+```{r}
+emc_algorithms() %>% filter(regression, core) %>% .[, 1:9] %>% kable()
+```
+
+The algorithms dataset has a much longer list of columns that can be used to filter algorithms by criteria like "All support vector machine algorithms" but I'm only showing a subset of them here
+
+To determine which of these core algorithm works best I'll simply try them all. 
+
+### Running the Age Prediction experiment
+
+First thing we need to do to set up an emc experiment it so to define the parameters for each task we will perform in the experiment. For the age prediction experiement its just all the algorithms we want to try.
+
+```{r}
+age_algorithms <- emc_algorithms() %>% dplyr::filter(regression, core) %>% dplyr::select(algorithm)
+```
+
+Emc uses the caret package to do most of the heavy lifting when it comes to invoking all the different machine learning algorithms. We'll need to set up the bits that caret needs to work. Here we set up the training data, train control and data pre-processing recipe.
+
+```{r}
+age_data <- 
+    # From our titanic data
+    titanic %>% 
+    
+    # Use the ages we know as the training set.
+    dplyr::filter(!is.na(Age)) %>%    
+    
+    # We need to exclude survived to prevent data leakage
+    dplyr::select(-Survived) %>%
+    
+    # Drop out the problematic columns
+    dplyr::select(-PassengerId, -Name, -Honourable_Title, -Deck) 
+
+age_recipe <- 
+    # Predict the age using all the remaing data
+    recipe(Age ~ ., data = age_data) %>%
+    
+    # Fix the skew in Fare
+    step_BoxCox(Fare) %>%
+    
+    # Fix the missing Fares
+    step_meanimpute(Fare) %>%              
+    
+    # Fix the missing port of embarkation
+    step_modeimpute(Embarked) %>%        
+    
+    # This will make a lot of algortihms happier
+    step_dummy(all_predictors(), -all_numeric()) %>%  
+    
+    # And so will this
+    step_center(all_predictors()) %>%      
+    step_scale(all_predictors())
+
+# Set up the assessment method
+set.seed(50)
+age_control <- trainControl(method = "repeatedcv", number = 5, repeats = 10)
+
+# We'll use RMSE as the assessment metric
+age_metric <- "RMSE"
+```
+
+For each set of parameters we need to train a model. Training a big list of models has a few issues. Out of the box they will often fail. They can often dump out tons of information which might be useful but can fill the console with pages of messages. Often running the experiment takes a while and we don't want to sit around watching it run.
+
+The emc_record function deals with lots of these problems. It automatically traps all errors and records all messages each algorithm generates. It has some other useful features like automatic caching to disk which is useful during development and report generation.
+
+Finally it collects all those results and returns it in a dataframe with one row per parameter. Any expression that has the property of returning a data frame with one row per input row can be collected together with the emc_bind function.
+
+The code that does this for models is shown below.
+
+```{r messages=FALSE}
+
+# Bind together
+age_models <- emc_bind(
+    # for each algorithm
+    age_algorithms,
+    
+    # a recording of
+    emc_record(
+        
+        # the result of training that algorithm and saving the result in the train column,
+        train = {               
+            set.seed(50)
+            train(age_recipe, age_data, method = algorithm, metric = age_metric, trControl = age_control)
+        },
+        
+        # Setting a label for each row,
+        .label = paste0("Age - Train ", algorithm), 
+        
+        # and caching the results to disk.
+        .cache_path = paste0("./Cache/Age/", .label, ".RDS"),
+
+        # We'll look at the messages later
+        .verbose = FALSE
+    ))
+        
+
+# Output the training results
+age_models %>% 
+    dplyr::select(-train, -train_log, -train_messages) %>% 
+    dplyr::arrange(desc(train_errors), desc(train_warnings), train_duration) %>% 
+    kable(digits=2)
+
+```
+
+The emc_record function added a number of status columns to the output data frame. From that we see all the algorithms seemed to have worked. However some of them generated warning messages. Also we have a record of how long each algorithm took to train in seconds.
+
+It might be useful to see what those warning messages were. We can do this by using the emc_replay function to replay the contents of the train_log column that was saved for each algorithm.
+
+```{r}
+age_models %>% 
+    filter(train_warnings > 0 | train_errors > 0) %>% 
+    pull(train_log) %>% 
+    emc_replay()
+```
+
+The replay shows that some of the algorithms had trouble with some of the cross validation data subsets. We could look closer, however We've got plenty of algorithms that worked fine so we'll just drop these algorithms out from further consideration.
+
+However I'd like to keep the null model as a baseline for comparing the other algorithms with.
+
+```{r}
+age_working_models <- age_models %>% filter(algorithm =="null" | (train_warnings == 0 & train_errors == 0))
+```
+
+### Viewing the algorithm performance
+
+The experiment was set up to do repeated cross validation for each algorithm. This process generated assessments for a fixed of resamples that we can use to assess the performance of each algorithm.
+
+We can use the emc_resamples function to bind the resamples to the working models dataset. However there are multiple resample rows for each algorithm. These get nested within each row of the query output. We can use the unnest function to unpack the resamples into one big data frame which we can look at.
+
+```{r}
+
+age_resamples <- 
+    # Bind the resamples to each model that worked
+    emc_bind(age_working_models, emc_resamples(train)) %>% 
+    
+    # Leave only the algorithm and resamples
+    dplyr::select(-starts_with("train_")) %>% 
+    
+    # And unpack the resamples
+    unnest(resamples)
+
+# Show a selection of the results
+age_resamples %>% arrange(Resample) %>% dplyr::slice(1:20) %>% kable(digits = 2)
+```
+
+Alrighty we can now assess the age prediction experiment. Lets produce a box plot of the mean absolute error of each resample for each algorithm.
+
+```{r}
+age_resamples %>%
+    ggplot(aes(x = fct_reorder(algorithm, MAE, .desc = TRUE), y = MAE)) + 
+    geom_boxplot() + 
+    coord_flip() +
+    xlab("Algorithm") +
+    ylab("Mean absolute error")
+```
+
+I've sorted the algorithms from best performing to worst. It looks like non-linear and tree algorithms are doing best. None are doing fantastically well however with extreme gradient boosting doing best with an MAE of a bit over 8.2 while the null model (which just uses the median) getting an MAE of 11.3. 
+
+But hey we'll take what we got.
+
+Lets use that xgbTree model to impute the missing values and save it in age_missing_predicted.
+
+```{r}
+
+age_best_model <- age_working_models %>% filter(algorithm == "xgbTree") %>% pull(train) %>% first()
+age_impute_rows <- which(is.na(titanic$Age))
+age_missing_predicted <- titanic$Age 
+age_missing_predicted[age_impute_rows] <- predict(age_best_model, newdata = titanic[age_impute_rows,])
+
+```
+
+Hmmm the "not great result" leads to an interesting question. Was doing all this work creating a predictive model for the age worth it, other than as an exercise? I sense another experiment coming on.
+
+## Age imputation performance
+
+So lets start another experiment. 
+
+I could just use the emc process to find which algorithm does the best in predicting who will survive the sinking of the Titanic. But lets do something more interesting. Lets compare how well imputing the age with the xgbTree algorithm compares with just imputing the missing ages with the median. And check that for all the core algorithms on the "did i survive the titanic problem".
+
+Lets do another imputation using the median age. 
+
+```{r}
+
+age_missing_median <- titanic$Age 
+age_missing_median[age_impute_rows] <- median(titanic$Age , na.rm = TRUE)
+
+```
+
+It sure is an awful lot less work and CPU cycles than building a predictive model.
+
+Lets define the experiments parameters. For each algorithm we want to compare "impute by prediction" with "impute by median". We'll use the core algorithms again but this time we want those that are suitable for a two class classification problem.
+
+```{r}
+survived_algorithms <- emc_algorithms() %>% dplyr::filter(two_class, core) %>% dplyr::select(algorithm)
+survived_parameters <- expand.grid(algorithm = survived_algorithms$algorithm, impute_by = factor(c("prediction", "median")))
+```
+
+Next setup all the stuff we need to record the experiment. But this time We will need two sets of data, one for each type of imputation.
+
+```{r}
+survived_data <- 
+    list(
+        # From our titanic data
+        prediction = titanic %>% 
+            
+                # replace age with fixed by prediction ages
+                mutate(Age = age_missing_predicted) %>%
+            
+                # filter down to the train data
+                filter(!is.na(Survived)) %>%
+            
+                # and drop the dodgy columns
+                select(-PassengerId, -Name, -Honourable_Title, -Deck),
+        
+        # And do the same again
+        median = titanic %>% 
+            
+                # but replace age with fixed by median ages
+                mutate(Age = age_missing_median) %>%
+                filter(!is.na(Survived)) %>%
+                select(-PassengerId, -Name, -Honourable_Title, -Deck)
+    )
+
+# Set up survived recipe like when we predicted the age
+survived_recipe <- 
+    recipe(
+        
+        # But we want to predict whether they survived
+        Survived ~ ., 
+        
+        # Its okay to give the recipe just one of the
+        # datasets here because its only using it to 
+        # identify the columns.
+        data = survived_data$predict) %>% 
+    
+    # Everything else stays the same
+    step_BoxCox(Fare) %>%                  
+    step_meanimpute(Fare) %>% 
+    step_modeimpute(Embarked) %>%
+    step_dummy(all_predictors(), -all_numeric()) %>%
+    step_center(all_predictors()) %>%
+    step_scale(all_predictors())
+
+# We've got more data so use 10 fold cross validation with less repeats
+set.seed(50)
+survived_control <- trainControl(method = "repeatedcv", number = 10, repeats = 3)
+survived_metric <- "Accuracy"
+```
+
+Lets get the whole shebang started. We bind the parameters with the recording of training the model using those parameters. We then bind on the resamples, using the same bind statement.
+
+```{r}
+# Bind together
+survived_models <- emc_bind(
+    
+    # the parameters
+    survived_parameters,
+    
+    # with the recording of the model training
+    emc_record(
+        # where the algorithm parameter set the algorithm to use
+        # and the impute_by parameter selects the data set.
+        train = {
+            set.seed(50)
+            train(survived_recipe, survived_data[[impute_by]], method = algorithm, metric = survived_metric, trControl = survived_control)
+        },
+        
+        # Set a label, feedback and caching as before.
+        .label = paste0("survived - Train ", algorithm, " impute ", impute_by),
+        .verbose = FALSE,
+        .cache_path = paste0("./Cache/Survived/", .label, ".RDS")
+    )
+)
+
+```
+
+Alright we aren't getting those few cents electicity back any time soon. Lets filter out the models that failed and plot the resample performances.
+
+```{r}
+survived_working_algorithms <-
+    survived_models %>% 
+    group_by(algorithm) %>% 
+    summarise(total_errors = sum(train_errors)) %>% 
+    filter(total_errors == 0)
+
+survived_working_models <- 
+    survived_models %>% 
+    filter(algorithm %in% survived_working_algorithms$algorithm)
+
+survived_resamples <- 
+    emc_bind(survived_working_models, emc_resamples(train)) %>% 
+    dplyr::select(algorithm, impute_by, resamples) %>% 
+    unnest(resamples)
+
+survived_resamples %>%
+    ggplot(aes(x = fct_reorder(algorithm, Accuracy, .desc = FALSE), y = Accuracy, color = impute_by)) + 
+    geom_boxplot() + 
+    coord_flip() +
+    xlab("Algorithm")
+
+
+```
+
+Doesn't look like their is much difference betwe. Maybe a little.
+
+If we want to be a little more *statistical* when comparing the two imputation methods, we can do a students t test that compares the accuracy of the two imputation methods across all the algorithms.
+
+```{r}
+t.test(Accuracy ~ impute_by, survived_resamples)
+```
+
+So we have p-value of 0.83 and a 95% confidence of the mean differences in accuracy being between -0.007 and 0.005. Strongly suggests that their is no significant difference in the imputation methods.
+
+We can use emc to do a t-test for all algorithms individually. Maybe it helped for some specific algorithms.
+
+```{r}
+
+emc_bind(
+    survived_working_algorithms,
+    emc_t_test(Accuracy ~ impute_by, filter(survived_resamples, algorithm == algorithm))
+) %>% 
+arrange(p_value) %>% 
+dplyr::slice(1:10) %>% 
+kable(digits = 2)
+
+```
+
+A tad more difference in performance for some algorithms but even the best p-value says its pretty likely its just chance variation.
+
+So our conclusion is that doing all that work to get a good predictive algorithm to impute the missing ages wasn't worth it. I probably should have stuck with using one of the imputation methods build into recipes.
+
+# Lessons Learned
+
